@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "credit_transactions_generation_refund_unique_idx" ON "credit_transactions" USING btree ("generation_id") WHERE "credit_transactions"."type" = 'REFUND';
