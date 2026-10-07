@@ -45,6 +45,14 @@ export class FileValidationError extends Error {
   }
 }
 
+export function extensionForMime(mimeType: AllowedMimeType): string {
+  return EXTENSION_BY_MIME[mimeType];
+}
+
+export function isAllowedMimeType(value: string): value is AllowedMimeType {
+  return (ALLOWED_MIME_TYPES as readonly string[]).includes(value);
+}
+
 export function maxUploadSizeFor(purpose: AssetPurpose): number {
   return SIZE_LIMITS_BYTES[purpose];
 }
@@ -68,8 +76,7 @@ function looksLikeAllowedImage(buffer: Buffer): boolean {
     buffer[5] === 0x0a &&
     buffer[6] === 0x1a &&
     buffer[7] === 0x0a;
-  const webp =
-    buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP";
+  const webp = buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP";
   return jpeg || png || webp;
 }
 
@@ -120,7 +127,11 @@ export async function validateImageBuffer(
 
   // A mismatch between what the browser claimed and what the file
   // signature actually shows is the classic "renamed .exe to .png" attack.
-  if (declaredMimeType && declaredMimeType.startsWith("image/") && declaredMimeType !== mimeType) {
+  if (
+    declaredMimeType &&
+    declaredMimeType.startsWith("image/") &&
+    declaredMimeType !== mimeType
+  ) {
     throw new FileValidationError(
       "MIME_MISMATCH",
       "The file's contents don't match its declared type.",

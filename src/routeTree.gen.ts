@@ -45,6 +45,7 @@ import { Route as BillingCancelRouteImport } from './routes/billing.cancel'
 import { Route as BillingSuccessRouteImport } from './routes/billing.success'
 import { Route as ProjectsProjectIdRouteImport } from './routes/projects.$projectId'
 import { Route as ApiAssetsUploadRouteImport } from './routes/api.assets.upload'
+import { Route as ApiCronCleanupGenerationsRouteImport } from './routes/api.cron.cleanup-generations'
 import { Route as ApiStripeWebhookRouteImport } from './routes/api.stripe.webhook'
 import { Route as ApiAssetsLocalSplatRouteImport } from './routes/api.assets.local.$'
 
@@ -228,6 +229,12 @@ const ApiAssetsUploadRoute = ApiAssetsUploadRouteImport.update({
   path: '/api/assets/upload',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiCronCleanupGenerationsRoute =
+  ApiCronCleanupGenerationsRouteImport.update({
+    id: '/api/cron/cleanup-generations',
+    path: '/api/cron/cleanup-generations',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ApiStripeWebhookRoute = ApiStripeWebhookRouteImport.update({
   id: '/api/stripe/webhook',
   path: '/api/stripe/webhook',
@@ -276,6 +283,7 @@ export interface FileRoutesByFullPath {
   '/projects/$projectId': typeof ProjectsProjectIdRoute
   '/admin/': typeof AdminIndexRoute
   '/api/assets/upload': typeof ApiAssetsUploadRoute
+  '/api/cron/cleanup-generations': typeof ApiCronCleanupGenerationsRoute
   '/api/stripe/webhook': typeof ApiStripeWebhookRoute
   '/api/assets/local/$': typeof ApiAssetsLocalSplatRoute
 }
@@ -316,6 +324,7 @@ export interface FileRoutesByTo {
   '/projects/$projectId': typeof ProjectsProjectIdRoute
   '/admin': typeof AdminIndexRoute
   '/api/assets/upload': typeof ApiAssetsUploadRoute
+  '/api/cron/cleanup-generations': typeof ApiCronCleanupGenerationsRoute
   '/api/stripe/webhook': typeof ApiStripeWebhookRoute
   '/api/assets/local/$': typeof ApiAssetsLocalSplatRoute
 }
@@ -357,6 +366,7 @@ export interface FileRoutesById {
   '/projects/$projectId': typeof ProjectsProjectIdRoute
   '/admin/': typeof AdminIndexRoute
   '/api/assets/upload': typeof ApiAssetsUploadRoute
+  '/api/cron/cleanup-generations': typeof ApiCronCleanupGenerationsRoute
   '/api/stripe/webhook': typeof ApiStripeWebhookRoute
   '/api/assets/local/$': typeof ApiAssetsLocalSplatRoute
 }
@@ -399,6 +409,7 @@ export interface FileRouteTypes {
     | '/projects/$projectId'
     | '/admin/'
     | '/api/assets/upload'
+    | '/api/cron/cleanup-generations'
     | '/api/stripe/webhook'
     | '/api/assets/local/$'
   fileRoutesByTo: FileRoutesByTo
@@ -439,6 +450,7 @@ export interface FileRouteTypes {
     | '/projects/$projectId'
     | '/admin'
     | '/api/assets/upload'
+    | '/api/cron/cleanup-generations'
     | '/api/stripe/webhook'
     | '/api/assets/local/$'
   id:
@@ -479,6 +491,7 @@ export interface FileRouteTypes {
     | '/projects/$projectId'
     | '/admin/'
     | '/api/assets/upload'
+    | '/api/cron/cleanup-generations'
     | '/api/stripe/webhook'
     | '/api/assets/local/$'
   fileRoutesById: FileRoutesById
@@ -519,6 +532,7 @@ export interface RootRouteChildren {
   BillingSuccessRoute: typeof BillingSuccessRoute
   AdminIndexRoute: typeof AdminIndexRoute
   ApiAssetsUploadRoute: typeof ApiAssetsUploadRoute
+  ApiCronCleanupGenerationsRoute: typeof ApiCronCleanupGenerationsRoute
   ApiStripeWebhookRoute: typeof ApiStripeWebhookRoute
   ApiAssetsLocalSplatRoute: typeof ApiAssetsLocalSplatRoute
 }
@@ -777,6 +791,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiAssetsUploadRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/cron/cleanup-generations': {
+      id: '/api/cron/cleanup-generations'
+      path: '/api/cron/cleanup-generations'
+      fullPath: '/api/cron/cleanup-generations'
+      preLoaderRoute: typeof ApiCronCleanupGenerationsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/stripe/webhook': {
       id: '/api/stripe/webhook'
       path: '/api/stripe/webhook'
@@ -842,6 +863,7 @@ const rootRouteChildren: RootRouteChildren = {
   BillingSuccessRoute: BillingSuccessRoute,
   AdminIndexRoute: AdminIndexRoute,
   ApiAssetsUploadRoute: ApiAssetsUploadRoute,
+  ApiCronCleanupGenerationsRoute: ApiCronCleanupGenerationsRoute,
   ApiStripeWebhookRoute: ApiStripeWebhookRoute,
   ApiAssetsLocalSplatRoute: ApiAssetsLocalSplatRoute,
 }

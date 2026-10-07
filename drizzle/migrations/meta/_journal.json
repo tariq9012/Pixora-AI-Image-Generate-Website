@@ -43,6 +43,13 @@
       "when": 1790694966502,
       "tag": "0005_tired_tempest",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790888684108,
+      "tag": "0006_white_energizer",
+      "breakpoints": true
     }
   ]
 }

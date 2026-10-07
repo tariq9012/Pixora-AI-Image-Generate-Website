@@ -31,3 +31,24 @@ export function buildStorageKey(userId: string, purpose: AssetPurpose, extension
   const id = randomUUID();
   return `users/${userId}/${folder}/${year}/${month}/${id}.${extension}`;
 }
+
+/**
+ * PHASE 14A: key for an object the BROWSER uploads directly (presigned
+ * PUT). It is a quarantine/intake location, deliberately separate from the
+ * final key returned by `buildStorageKey`:
+ *
+ *  - the client holds a write-capable URL for this key until it expires, so
+ *    nothing in it is ever trusted or served;
+ *  - finalize validates the bytes, then the SERVER writes them to a fresh
+ *    final key the client never had a URL for (no validate-then-overwrite
+ *    race), and deletes this one;
+ *  - a single bucket lifecycle rule on the `pending-uploads/` prefix
+ *    (recommended in docs/PRODUCTION.md) garbage-collects anything that
+ *    was never finalized.
+ *
+ * Only server-derived pieces go in: user id (from the session), a fresh
+ * UUID, and an extension that comes from the server-approved MIME type.
+ */
+export function buildPendingUploadKey(userId: string, extension: string): string {
+  return `pending-uploads/${userId}/${randomUUID()}.${extension}`;
+}

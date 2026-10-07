@@ -5,7 +5,8 @@ import { env } from "@/lib/env.server";
 import { isSameOriginRequest } from "@/lib/security/origin.server";
 import { SESSION_COOKIE_NAME } from "@/lib/auth/cookies.server";
 import { validateSessionToken } from "@/lib/auth/session.server";
-import { ASSET_PURPOSES, type AssetPurpose } from "@/lib/storage/types";
+import { getStorageProvider } from "@/lib/storage/provider.server";
+import { isUserUploadPurpose, type UserUploadPurpose } from "@/lib/storage/types";
 import { uploadAsset } from "@/lib/storage/storage.server";
 import { FileValidationError } from "@/lib/storage/validation";
 
@@ -39,8 +40,10 @@ function readSessionTokenFromRequest(request: Request): string | undefined {
   }
 }
 
-function isAssetPurpose(value: FormDataEntryValue | null): value is AssetPurpose {
-  return typeof value === "string" && (ASSET_PURPOSES as readonly string[]).includes(value);
+// PHASE 14A: browsers may only upload the allowlisted user purposes. This
+// route used to accept ANY purpose, including system-only GENERATED_OUTPUT.
+function isAssetPurpose(value: FormDataEntryValue | null): value is UserUploadPurpose {
+  return isUserUploadPurpose(value);
 }
 
 function jsonError(status: number, code: string, message: string): Response {
@@ -72,6 +75,19 @@ export const Route = createFileRoute("/api/assets/upload")({
           return jsonError(403, "FORBIDDEN", "This account cannot perform this action.");
         }
 
+        // PHASE 14A: with a direct-upload capable storage provider (S3/R2)
+        // the browser must use createUploadIntentFn -> presigned PUT ->
+        // finalizeUploadFn instead. Pushing the file through this route would
+        // hit the serverless request-body limit anyway. Local development
+        // storage keeps using this route exactly as before.
+        if (getStorageProvider().supportsDirectUpload) {
+          return jsonError(
+            400,
+            "DIRECT_UPLOAD_REQUIRED",
+            "Uploads must use the direct upload flow.",
+          );
+        }
+
         const rateLimit = checkRateLimit(`upload:${session.user.id}`, {
           max: 30,
           windowMs: 60 * 60 * 1000,
@@ -87,8 +103,7 @@ export const Route = createFileRoute("/api/assets/upload")({
         // per-purpose limits in storage/validation.ts still apply.
         const HARD_BODY_CAP_BYTES = 21 * 1024 * 1024;
         const proxyCap =
-          env.UPLOAD_PROXY_MAX_BYTES ??
-          (env.NODE_ENV === "production" ? 4 * 1024 * 1024 : HARD_BODY_CAP_BYTES);
+          env.UPLOAD_PROXY_MAX_BYTES ?? (env.NODE_ENV === "production" ? 4 * 1024 * 1024 : HARD_BODY_CAP_BYTES);
         const declaredLength = Number(request.headers.get("content-length") ?? "0");
         if (declaredLength > Math.min(proxyCap, HARD_BODY_CAP_BYTES) + 64 * 1024) {
           const capMb = Math.floor(Math.min(proxyCap, HARD_BODY_CAP_BYTES) / (1024 * 1024));

@@ -12,10 +12,15 @@ import {
   uploadAsset,
 } from "@/lib/storage/storage.server";
 
-import { refundCreditsIfNotAlready, reserveCredits } from "../credits.server";
+import { reserveCredits } from "../credits.server";
 import { withDbRetry } from "../db-retry.server";
 import { buildEditorCanvas, buildOutpaintCanvas, compositeOutpaintResult } from "./canvas.server";
 import { GenerationError } from "./errors.server";
+import {
+  failGenerationAndRefund,
+  markGenerationCompleted,
+  markGenerationProcessing,
+} from "./lifecycle.server";
 import { logPersistFailure } from "./log-safe.server";
 import { isBackgroundRemovalSupportedPlatform } from "./local/background-removal.server";
 import { isUpscaleSupportedPlatform } from "./local/upscale.server";
@@ -127,12 +132,7 @@ export async function generateTextToImage(
   });
 
   try {
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({ status: "PROCESSING", startedAt: new Date() })
-        .where(eq(generations.id, generationId)),
-    );
+    await markGenerationProcessing(generationId);
 
     const provider = getAiProvider(model.provider);
     const result = await provider.generateTextToImage(model.providerModelId, {
@@ -202,17 +202,10 @@ export async function generateTextToImage(
         : new GenerationError("OUTPUT_STORAGE_FAILED", "Failed to save the generated image.");
     }
 
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({
-          status: "COMPLETED",
-          completedAt: new Date(),
-          outputImageUrl: createdCreations[0]?.url ?? null,
-          providerJobId: result.providerJobId,
-        })
-        .where(eq(generations.id, generationId)),
-    );
+    await markGenerationCompleted(generationId, {
+      outputImageUrl: createdCreations[0]?.url ?? null,
+      providerJobId: result.providerJobId,
+    });
 
     return { generationId, creations: createdCreations };
   } catch (error) {
@@ -225,26 +218,13 @@ export async function generateTextToImage(
       console.error("Unexpected error during generation:", error);
     }
 
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({
-          status: "FAILED",
-          completedAt: new Date(),
-          errorCode: genError.code,
-          errorMessage: genError.message,
-        })
-        .where(eq(generations.id, generationId)),
-    );
-
-    await withDbRetry(() =>
-      refundCreditsIfNotAlready(
-        input.userId,
-        cost,
-        generationId,
-        `Refund for failed generation (${genError.code})`,
-      ),
-    );
+    await failGenerationAndRefund({
+      userId: input.userId,
+      generationId,
+      cost,
+      code: genError.code,
+      message: genError.message,
+    });
 
     throw genError;
   }
@@ -403,12 +383,7 @@ export async function generateImageToImage(
   });
 
   try {
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({ status: "PROCESSING", startedAt: new Date() })
-        .where(eq(generations.id, generationId)),
-    );
+    await markGenerationProcessing(generationId);
 
     // Re-read the source bytes fresh here (not reused from the
     // pre-reservation check above) — keeps the credit transaction free of
@@ -510,17 +485,10 @@ export async function generateImageToImage(
         : new GenerationError("OUTPUT_STORAGE_FAILED", "Failed to save the generated image.");
     }
 
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({
-          status: "COMPLETED",
-          completedAt: new Date(),
-          outputImageUrl: createdCreation.url,
-          providerJobId: result.providerJobId,
-        })
-        .where(eq(generations.id, generationId)),
-    );
+    await markGenerationCompleted(generationId, {
+      outputImageUrl: createdCreation.url,
+      providerJobId: result.providerJobId,
+    });
 
     return { generationId, creation: createdCreation };
   } catch (error) {
@@ -533,26 +501,13 @@ export async function generateImageToImage(
       console.error("Unexpected error during image-to-image generation:", error);
     }
 
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({
-          status: "FAILED",
-          completedAt: new Date(),
-          errorCode: genError.code,
-          errorMessage: genError.message,
-        })
-        .where(eq(generations.id, generationId)),
-    );
-
-    await withDbRetry(() =>
-      refundCreditsIfNotAlready(
-        input.userId,
-        cost,
-        generationId,
-        `Refund for failed generation (${genError.code})`,
-      ),
-    );
+    await failGenerationAndRefund({
+      userId: input.userId,
+      generationId,
+      cost,
+      code: genError.code,
+      message: genError.message,
+    });
 
     throw genError;
   }
@@ -674,12 +629,7 @@ export async function generateBackgroundRemoval(
   });
 
   try {
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({ status: "PROCESSING", startedAt: new Date() })
-        .where(eq(generations.id, generationId)),
-    );
+    await markGenerationProcessing(generationId);
 
     // Re-read the source bytes fresh (not reused from the pre-reservation
     // check) — see generateImageToImage's identical comment above for why.
@@ -771,17 +721,10 @@ export async function generateBackgroundRemoval(
         : new GenerationError("OUTPUT_STORAGE_FAILED", "Failed to save the processed image.");
     }
 
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({
-          status: "COMPLETED",
-          completedAt: new Date(),
-          outputImageUrl: createdCreation.url,
-          providerJobId: result.providerJobId,
-        })
-        .where(eq(generations.id, generationId)),
-    );
+    await markGenerationCompleted(generationId, {
+      outputImageUrl: createdCreation.url,
+      providerJobId: result.providerJobId,
+    });
 
     return { generationId, creation: createdCreation };
   } catch (error) {
@@ -794,26 +737,13 @@ export async function generateBackgroundRemoval(
       console.error("Unexpected error during background removal:", error);
     }
 
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({
-          status: "FAILED",
-          completedAt: new Date(),
-          errorCode: genError.code,
-          errorMessage: genError.message,
-        })
-        .where(eq(generations.id, generationId)),
-    );
-
-    await withDbRetry(() =>
-      refundCreditsIfNotAlready(
-        input.userId,
-        cost,
-        generationId,
-        `Refund for failed generation (${genError.code})`,
-      ),
-    );
+    await failGenerationAndRefund({
+      userId: input.userId,
+      generationId,
+      cost,
+      code: genError.code,
+      message: genError.message,
+    });
 
     throw genError;
   }
@@ -920,12 +850,7 @@ export async function generateUpscale(input: GenerateUpscaleInput): Promise<Gene
   });
 
   try {
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({ status: "PROCESSING", startedAt: new Date() })
-        .where(eq(generations.id, generationId)),
-    );
+    await markGenerationProcessing(generationId);
 
     let sourceBuffer: Buffer;
     let sourceMimeType: string;
@@ -1012,17 +937,10 @@ export async function generateUpscale(input: GenerateUpscaleInput): Promise<Gene
         : new GenerationError("OUTPUT_STORAGE_FAILED", "Failed to save the upscaled image.");
     }
 
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({
-          status: "COMPLETED",
-          completedAt: new Date(),
-          outputImageUrl: createdCreation.url,
-          providerJobId: result.providerJobId,
-        })
-        .where(eq(generations.id, generationId)),
-    );
+    await markGenerationCompleted(generationId, {
+      outputImageUrl: createdCreation.url,
+      providerJobId: result.providerJobId,
+    });
 
     return {
       generationId,
@@ -1041,26 +959,13 @@ export async function generateUpscale(input: GenerateUpscaleInput): Promise<Gene
       console.error("Unexpected error during upscaling:", error);
     }
 
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({
-          status: "FAILED",
-          completedAt: new Date(),
-          errorCode: genError.code,
-          errorMessage: genError.message,
-        })
-        .where(eq(generations.id, generationId)),
-    );
-
-    await withDbRetry(() =>
-      refundCreditsIfNotAlready(
-        input.userId,
-        cost,
-        generationId,
-        `Refund for failed generation (${genError.code})`,
-      ),
-    );
+    await failGenerationAndRefund({
+      userId: input.userId,
+      generationId,
+      cost,
+      code: genError.code,
+      message: genError.message,
+    });
 
     throw genError;
   }
@@ -1183,12 +1088,7 @@ export async function generateOutpaint(input: GenerateOutpaintInput): Promise<Ge
   });
 
   try {
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({ status: "PROCESSING", startedAt: new Date() })
-        .where(eq(generations.id, generationId)),
-    );
+    await markGenerationProcessing(generationId);
 
     let sourceBuffer: Buffer;
     try {
@@ -1288,17 +1188,10 @@ export async function generateOutpaint(input: GenerateOutpaintInput): Promise<Ge
         : new GenerationError("OUTPUT_STORAGE_FAILED", "Failed to save the expanded image.");
     }
 
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({
-          status: "COMPLETED",
-          completedAt: new Date(),
-          outputImageUrl: createdCreation.url,
-          providerJobId: result.providerJobId,
-        })
-        .where(eq(generations.id, generationId)),
-    );
+    await markGenerationCompleted(generationId, {
+      outputImageUrl: createdCreation.url,
+      providerJobId: result.providerJobId,
+    });
 
     return { generationId, creation: createdCreation, outputWidth: targetWidth, outputHeight: targetHeight, wasDownscaled };
   } catch (error) {
@@ -1311,26 +1204,13 @@ export async function generateOutpaint(input: GenerateOutpaintInput): Promise<Ge
       console.error("Unexpected error during outpainting:", error);
     }
 
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({
-          status: "FAILED",
-          completedAt: new Date(),
-          errorCode: genError.code,
-          errorMessage: genError.message,
-        })
-        .where(eq(generations.id, generationId)),
-    );
-
-    await withDbRetry(() =>
-      refundCreditsIfNotAlready(
-        input.userId,
-        cost,
-        generationId,
-        `Refund for failed generation (${genError.code})`,
-      ),
-    );
+    await failGenerationAndRefund({
+      userId: input.userId,
+      generationId,
+      cost,
+      code: genError.code,
+      message: genError.message,
+    });
 
     throw genError;
   }
@@ -1477,12 +1357,7 @@ export async function generateEditorEdit(input: GenerateEditorInput): Promise<Ge
   });
 
   try {
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({ status: "PROCESSING", startedAt: new Date() })
-        .where(eq(generations.id, generationId)),
-    );
+    await markGenerationProcessing(generationId);
 
     let sourceBuffer: Buffer;
     try {
@@ -1587,17 +1462,10 @@ export async function generateEditorEdit(input: GenerateEditorInput): Promise<Ge
         : new GenerationError("OUTPUT_STORAGE_FAILED", "Failed to save the edited image.");
     }
 
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({
-          status: "COMPLETED",
-          completedAt: new Date(),
-          outputImageUrl: createdCreation.url,
-          providerJobId: result.providerJobId,
-        })
-        .where(eq(generations.id, generationId)),
-    );
+    await markGenerationCompleted(generationId, {
+      outputImageUrl: createdCreation.url,
+      providerJobId: result.providerJobId,
+    });
 
     return {
       generationId,
@@ -1616,26 +1484,13 @@ export async function generateEditorEdit(input: GenerateEditorInput): Promise<Ge
       console.error("Unexpected error during editor generation:", error);
     }
 
-    await withDbRetry(() =>
-      db
-        .update(generations)
-        .set({
-          status: "FAILED",
-          completedAt: new Date(),
-          errorCode: genError.code,
-          errorMessage: genError.message,
-        })
-        .where(eq(generations.id, generationId)),
-    );
-
-    await withDbRetry(() =>
-      refundCreditsIfNotAlready(
-        input.userId,
-        cost,
-        generationId,
-        `Refund for failed generation (${genError.code})`,
-      ),
-    );
+    await failGenerationAndRefund({
+      userId: input.userId,
+      generationId,
+      cost,
+      code: genError.code,
+      message: genError.message,
+    });
 
     throw genError;
   }

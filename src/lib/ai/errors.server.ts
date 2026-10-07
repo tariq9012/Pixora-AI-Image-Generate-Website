@@ -15,7 +15,10 @@ export type AiErrorCode =
   | "GENERATION_FAILED"
   // Phase 11 (Editor / masked inpainting) additions.
   | "EMPTY_EDIT_MASK"
-  | "INVALID_MASK";
+  | "INVALID_MASK"
+  // Phase 14B: a generation that never reached a terminal state (killed
+  // function, crash, hung provider) and was closed out by the cleanup job.
+  | "GENERATION_TIMEOUT";
 
 /**
  * The only kind of error the generation pipeline throws on purpose.

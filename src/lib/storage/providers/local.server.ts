@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import type { PutObjectInput, StorageProvider } from "../types";
@@ -25,6 +25,7 @@ export function createLocalStorageProvider(): StorageProvider {
 
   return {
     name: "local",
+    supportsDirectUpload: false,
     async putObject({ key, body }: PutObjectInput) {
       const path = absolutePathFor(key);
       await mkdir(dirname(path), { recursive: true });
@@ -47,6 +48,19 @@ export function createLocalStorageProvider(): StorageProvider {
     },
     async getObjectBuffer(key: string) {
       return readFile(absolutePathFor(key));
+    },
+    async createPresignedPutUrl() {
+      // Local dev uses the server upload route (POST /api/assets/upload).
+      throw new Error("Direct upload is not supported by the local storage provider.");
+    },
+    async headObject(key: string) {
+      try {
+        const info = await stat(absolutePathFor(key));
+        return { size: info.size, contentType: null };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      }
     },
   };
 }

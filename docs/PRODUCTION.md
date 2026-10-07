@@ -167,3 +167,240 @@ npm outdated                # report only
 ```
 After `npm run build`: `grep -rEl "sk_(test|live)_|whsec_|postgres(ql)?://|CLOUDFLARE_API_TOKEN|S3_SECRET" dist/client` must list nothing, and `grep -rl onnxruntime dist/client` must list nothing.
 Manual security tests to run and record: unauthenticated protected routes; wrong password; suspended user; logout; password change; cross-user asset/creation/favorite/delete/download IDs; tampered pack slug/plan/interval; success-page visit without payment; bad webhook signature (expect 400); duplicate webhook (expect 200 skipped); insufficient credits; double-click generation; forced provider failure (single refund); 10MB and renamed `.exe` as `.png` uploads; concurrent generations with exactly one generation of credit.
+
+---
+
+# Phase 14A — Direct-to-R2 uploads
+
+**Status: implemented, NOT yet verified against a real R2 bucket or a real Vercel deployment.**
+Nothing below has been run end-to-end; see "Manual test procedure".
+
+## Why
+Vercel Functions reject request bodies above ~4.5 MB before our code runs, but Pixora accepts
+images up to 20 MB (8 MB for Image-to-Image, 5 MB avatars). In S3/R2 mode the browser therefore
+uploads straight to R2 and only small JSON requests go through Vercel.
+
+## Previous flow (still used when `STORAGE_PROVIDER=local`)
+`useAssetUpload` -> `POST /api/assets/upload` (multipart) -> `uploadAsset()` (validate, strip EXIF for
+public purposes, write to storage, insert `assets` row) -> `{ asset }`.
+
+## New flow (`STORAGE_PROVIDER=s3`, i.e. R2)
+1. **Authorize** — `createUploadIntentFn` (server function, session user only). Input: purpose,
+   filename, MIME type, size. Checks: purpose allowlist, MIME in {jpeg, png, webp}, declared size vs
+   per-purpose limit, rate limit (30/h), at most 10 unfinished intents per user. Inserts an
+   `upload_intents` row, generates a **server-chosen quarantine key**
+   `pending-uploads/<userId>/<uuid>.<ext>`, and returns a presigned `PUT` URL (**5 minutes**) whose
+   signature is bound to the exact `Content-Type`.
+2. **Upload** — the browser `PUT`s the file to `https://<ACCOUNT_ID>.r2.cloudflarestorage.com/...`
+   (the S3 API endpoint; presigned URLs do not work on custom domains) with real progress
+   (`XMLHttpRequest`). No R2 credential ever reaches the browser.
+3. **Finalize** — `finalizeUploadFn({ intentId })`. Only the intent UUID is accepted (never a key,
+   bucket or user id), looked up scoped to the session user. Then: `HeadObject` -> actual size
+   (authoritative, checked **before** downloading) and stored Content-Type -> read the bytes ->
+   the **same** `uploadAsset()` pipeline as the legacy route (magic bytes, MIME vs signature,
+   decode, dimension/pixel limits, EXIF stripping for avatars) -> the **server** writes the validated
+   bytes to a fresh final key the client never had a URL for -> `assets` row created -> the
+   quarantine object is deleted -> `{ asset }` in the same shape as before (tools keep using `assetId`).
+
+Design choices worth knowing:
+- **Persistent intents (DB), not memory** — authorize and finalize can hit different serverless instances.
+- **Quarantine key + server copy** — a presigned URL stays usable until it expires. If the final
+  asset were the same object, a user could overwrite it with unvalidated bytes right after finalize.
+  Because the server re-writes the validated bytes to a different key, that race does not exist.
+- **Single finalization** — an atomic `finalize_claimed_at` claim means double-clicks/retries create
+  one asset; a finished intent returns the existing asset. A crashed finalize can be re-claimed after 2 min.
+- **Retry without re-upload** — the hook retries finalize (transient/in-progress errors) with backoff.
+- **Rejections are permanent** — bad magic bytes, wrong/mismatched type, oversize, wrong declared
+  size, corrupt image: the intent is invalidated and the object deleted (a failed delete is logged).
+- **Intent lifetime** = 20 minutes (5 min upload + finalize grace); presigned URL = 5 minutes.
+- Only these purposes can be requested by a browser: `AVATAR`, `IMAGE_TO_IMAGE_INPUT`,
+  `BACKGROUND_REMOVAL_INPUT`, `UPSCALE_INPUT`, `OUTPAINT_INPUT`, `EDITOR_INPUT`. (Before 14A the
+  legacy route accepted **any** purpose, including the system-only, publicly served `GENERATED_OUTPUT`.)
+- In S3/R2 mode `POST /api/assets/upload` returns `DIRECT_UPLOAD_REQUIRED`. Local mode is unchanged.
+
+Known limit: a presigned PUT cannot cap the byte count at R2, so a user could PUT more than they
+declared. Finalize rejects and deletes it (and the per-user intent cap + rate limit + lifecycle rule
+bound the cost), but the bytes do exist in the bucket briefly. Signing `content-length` is a possible
+later hardening once real R2 behaviour has been tested.
+
+## Required environment (no new variables)
+`STORAGE_PROVIDER=s3`, `S3_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com`, `S3_REGION=auto`,
+`S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_PUBLIC_BASE_URL`.
+The API token behind the S3 credentials needs **Object Read & Write** on the bucket — a read-only
+token fails as `AccessDenied` both on the browser PUT and on the server-side write at finalize.
+- Local: `STORAGE_PROVIDER=local` (no R2 needed) — or `s3` + a dev bucket + localhost CORS below.
+- Preview: `s3` with a **separate** bucket (or at least a separate token/prefix); CORS for the preview origin.
+- Production: `s3` with the production bucket; CORS for the production domain only.
+
+## R2 CORS (bucket -> Settings -> CORS policy)
+Production:
+```json
+[
+  {
+    "AllowedOrigins": ["https://<PRODUCTION_DOMAIN>"],
+    "AllowedMethods": ["PUT"],
+    "AllowedHeaders": ["Content-Type"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+Local development: same, with `"AllowedOrigins": ["http://localhost:5173"]`. Add a preview origin only
+if previews really upload. Never use `"*"` in production. `GET`/`HEAD` are not needed: the browser
+only ever PUTs; all reads happen server-side.
+
+Symptoms when it is wrong:
+- Browser console "blocked by CORS policy" and the hook says *"Couldn't reach file storage"* -> CORS missing/wrong origin.
+- `403 SignatureDoesNotMatch` -> the request's `Content-Type` differs from the signed one (or the URL was altered/expired).
+- `403 AccessDenied` -> the R2 token lacks write permission on this bucket.
+- `403 ... expired`/`Request has expired` -> more than 5 minutes passed before the PUT started.
+
+## Bucket lifecycle (orphan cleanup) — recommended, configure once
+R2 -> bucket -> Settings -> Object lifecycle rules: **delete objects with prefix `pending-uploads/`
+after 1 day**. That makes orphaned quarantine objects self-cleaning even if no job ever runs.
+Additionally `cleanupExpiredUploadIntents()` (in `src/lib/storage/direct-upload.server.ts`) deletes
+expired, unfinished intents and their objects and trims old completed rows. It is **not scheduled
+yet**; wire it into the same cron that will reconcile stuck generations. Uploads do not depend on it.
+
+## Private inputs / public outputs (bucket design) — still open
+Inputs (`.../inputs/...`), quarantine (`pending-uploads/...`) and generated outputs / avatars share
+one bucket, and outputs/avatars are served via `S3_PUBLIC_BASE_URL`. The bucket itself stays private
+and presigned PUT does not require public access — but making the bucket public for outputs would
+expose every key. Preferred: a **second, public bucket** for outputs/avatars (needs a small code change:
+a separate public bucket setting) . Interim, no code: serve the public domain through a Cloudflare
+custom domain with a WAF custom rule that blocks everything except
+`^/users/[^/]+/(outputs|avatars|projects)/`. Do **not** enable the raw `r2.dev` URL on the bucket
+that holds inputs. Avatars are public by design and are EXIF-stripped on every path.
+
+## Manual test procedure (none of this has been run)
+Prerequisites: R2 token with Object Read & Write, CORS applied, migration applied.
+1. **8-10 MB image** (S3 mode): authorize and finalize requests are small JSON, the PUT goes to
+   `*.r2.cloudflarestorage.com`, no 413, asset created, then run Expand/Editor with that asset id.
+2. **Small image** (<1 MB): same result.
+3. **Invalid bytes** (text/`.exe` renamed `.png`) signed as `image/png`: finalize rejects; no `assets` row; pending object gone.
+4. **MIME spoof** (JPEG bytes, signed as `image/png`): finalize rejects (`MIME_MISMATCH`).
+5. **Oversize**: >limit is refused at authorize; a spoofed declared size is rejected at finalize (`SIZE_MISMATCH`/`FILE_TOO_LARGE`).
+6. **Cross-user**: user B calls finalize with user A's intent id -> "not found", no asset.
+7. **Arbitrary key**: finalize with anything that is not an intent UUID -> "not found".
+8. **Double finalize** (double-click or two calls): one `assets` row, same asset id both times.
+9. **Expired intent**: set `expires_at` in the past -> `UPLOAD_EXPIRED`, no asset.
+10. **Corrupt/truncated JPEG/PNG** -> rejected.
+11. **Local regression** (`STORAGE_PROVIDER=local`): avatar, Background Removal, Upscale, Expand, Editor uploads work as before.
+12. **History/My Creations** show generated outputs only, never uploaded inputs.
+
+---
+
+# Phase 14B — Stuck generations cleanup + automatic refunds
+
+**Status: code written and parse-checked only. NOT typechecked, linted, built or runtime-tested** (the environment it was written in had no `node_modules`). Run the checks and manual tests below before relying on it.
+
+## Problem
+Every generation flow commits `generations` (QUEUED) + credit reservation, then does a separate `QUEUED -> PROCESSING` update, then the slow provider work. If the process dies after the reservation commit (Vercel timeout, crash, OOM, deploy), the catch/refund code never runs: the row stays QUEUED/PROCESSING and the credits stay deducted.
+
+## Stale policy
+- One global threshold: `GENERATION_STALE_MINUTES` (integer 5-240, default 15).
+- `PROCESSING` and `started_at <= now - threshold` (`started_at` is set in the same UPDATE that sets PROCESSING; `created_at` is only a fallback if it were ever null).
+- `QUEUED` and `created_at <= now - threshold` (QUEUED really is used: it exists between the credit transaction commit and the PROCESSING update, so it can be stranded too).
+- All timestamps are `timestamptz` compared as `Date` objects (UTC).
+
+## Design
+- `src/lib/ai/lifecycle.server.ts` — guarded transitions used by all six flows (Text-to-Image, Image-to-Image, Background Removal, Upscale, Expand, Editor):
+  - `QUEUED -> PROCESSING` only `WHERE status = 'QUEUED'`; if the cleanup already failed the row, the request throws `GENERATION_TIMEOUT` and never calls the provider.
+  - `PROCESSING -> COMPLETED` only `WHERE status = 'PROCESSING'`. If cleanup won, the request's own `creations` rows (that `generation_id` only) are **soft-deleted** (`is_deleted = true`, no storage object touched) and `GENERATION_TIMEOUT` is thrown. A zero-row result first re-reads the status so a `withDbRetry` retry after a real commit is not mistaken for a lost race.
+  - Normal failure: `QUEUED|PROCESSING -> FAILED` only (a COMPLETED row is never overwritten); refund skipped only if the row is COMPLETED.
+- `src/lib/ai/cleanup.server.ts`:
+  - `cleanupStaleGenerations()` — bounded batch (`CLEANUP_BATCH_SIZE = 50`, oldest first). For each candidate one conditional `UPDATE ... SET status='FAILED', error_code='GENERATION_TIMEOUT', completed_at=now WHERE id=? AND <stale predicate> RETURNING`. Zero rows = someone else changed it; skipped. Only a claimed row is refunded.
+  - Refund amount = sum of the original `GENERATION` ledger rows for that generation (never the model's current price). No deduction row = nothing refunded.
+  - Refund goes through the existing `refundCreditsIfNotAlready` (its unique partial index `credit_transactions_generation_refund_unique_idx` makes a second refund impossible). It now returns `true` only when it actually wrote the refund, so counts are accurate.
+  - `reconcileTimedOutGenerationRefunds()` — retries refunds for rows that are `FAILED`, `error_code = 'GENERATION_TIMEOUT'`, have a `GENERATION` ledger row and no `REFUND` row. This is the recovery path if the refund fails after the claim (Option B: the existing refund service owns its own transaction, so claim + refund are not one transaction).
+- `src/routes/api.cron.cleanup-generations.ts` — `GET` (Vercel Cron) and `POST` (manual). `503` if `CRON_SECRET` is unset, `401` unless `Authorization: Bearer <CRON_SECRET>` (constant-time compare; never read from the query string), `500` generic on failure. Response: `{ ok, scanned, claimed, skipped, refunded, refundFailed, reconciled }` — no ids, prompts, balances.
+- No schema change, no migration, no new package, no new status.
+
+## Environment
+```
+CRON_SECRET=<min 32 chars>          # required in production (boot fails without it)
+GENERATION_STALE_MINUTES=15         # optional, 5-240
+```
+Generate a secret (PowerShell): `-join ((48..57)+(97..102) | Get-Random -Count 64 | ForEach-Object {[char]$_})`  (or `openssl rand -hex 32`).
+
+## Vercel
+`vercel.json` (new file — there was none) registers `*/10 * * * *` -> `/api/cron/cleanup-generations`. Crons run only on **production** deployments and are always `GET`. Set `CRON_SECRET` in Vercel (Production); Vercel sends it as `Authorization: Bearer`.
+**Hobby plan only allows once-per-day crons — a `*/10` schedule is rejected at deploy.** On Hobby either change the schedule to a daily one (credits then stay stuck up to a day) or call the endpoint from an external scheduler with the Bearer header. After the first deploy confirm the job under Project -> Settings -> Cron Jobs (this project builds through the Nitro Vercel preset; registration from `vercel.json` has not been verified here).
+
+## Local testing (PowerShell, dev server on :5173)
+```powershell
+$secret = "<CRON_SECRET from your .env>"
+# authorized
+Invoke-RestMethod -Uri "http://localhost:5173/api/cron/cleanup-generations" -Headers @{ Authorization = "Bearer $secret" }
+# unauthorized (expect 401)
+curl.exe -i http://localhost:5173/api/cron/cleanup-generations
+curl.exe -i -H "Authorization: Bearer wrong" http://localhost:5173/api/cron/cleanup-generations
+# secret in the query string must NOT work (expect 401)
+curl.exe -i "http://localhost:5173/api/cron/cleanup-generations?secret=$secret"
+# two near-simultaneous runs
+1..2 | ForEach-Object { Start-Job { curl.exe -s -H "Authorization: Bearer $using:secret" http://localhost:5173/api/cron/cleanup-generations } } | Wait-Job | Receive-Job
+```
+
+## SQL (dev/test database only)
+```sql
+-- A. Create a stale PROCESSING generation with a 4-credit deduction (replace <USER_ID>)
+BEGIN;
+WITH g AS (
+  INSERT INTO generations (user_id, type, status, credits_used, prompt, created_at, started_at)
+  VALUES ('<USER_ID>', 'TEXT_TO_IMAGE', 'PROCESSING', 4, 'stale test',
+          now() - interval '31 minutes', now() - interval '30 minutes')
+  RETURNING id
+), t AS (
+  INSERT INTO credit_transactions (user_id, amount, type, description, generation_id)
+  SELECT '<USER_ID>', -4, 'GENERATION', 'stale test deduction', id FROM g
+  RETURNING generation_id
+)
+UPDATE credit_balances SET balance = balance - 4, updated_at = now() WHERE user_id = '<USER_ID>';
+COMMIT;
+
+-- B. Balance before / after
+SELECT balance FROM credit_balances WHERE user_id = '<USER_ID>';
+
+-- C. State + ledger for one generation
+SELECT id, status, error_code, error_message, started_at, completed_at, credits_used
+FROM generations WHERE id = '<GENERATION_ID>';
+SELECT type, amount, created_at, description
+FROM credit_transactions WHERE generation_id = '<GENERATION_ID>' ORDER BY created_at;
+
+-- D. Anything still stranded
+SELECT id, status, created_at, started_at FROM generations
+WHERE status IN ('QUEUED','PROCESSING') ORDER BY created_at;
+
+-- E. Timeout-failed rows with NO refund (should be empty after a cleanup run)
+SELECT g.id, g.user_id, g.completed_at
+FROM generations g
+WHERE g.status = 'FAILED' AND g.error_code = 'GENERATION_TIMEOUT'
+  AND EXISTS (SELECT 1 FROM credit_transactions t WHERE t.generation_id = g.id AND t.type = 'GENERATION')
+  AND NOT EXISTS (SELECT 1 FROM credit_transactions t WHERE t.generation_id = g.id AND t.type = 'REFUND');
+
+-- F. Exactly-once check: must return zero rows
+SELECT generation_id, count(*) FROM credit_transactions
+WHERE type = 'REFUND' AND generation_id IS NOT NULL GROUP BY generation_id HAVING count(*) > 1;
+
+-- G. Simulate "claimed but refund failed" (then run the cron: expect reconciled = 1)
+UPDATE generations SET status='FAILED', error_code='GENERATION_TIMEOUT',
+  error_message='Generation timed out before completion.', completed_at=now()
+WHERE id = '<GENERATION_ID>';
+```
+
+## Manual test checklist (none of it has been run)
+1. Unauthorized: no header / wrong secret / query-string secret -> 401; `CRON_SECRET` unset in dev -> 503.
+2. Stale: run SQL A, call cron -> `claimed 1, refunded 1`; generation FAILED + `GENERATION_TIMEOUT`, `completed_at` set, one REFUND row of +4, balance back to the pre-A value.
+3. Run the cron again -> `claimed 0, refunded 0`; balance unchanged.
+4. Fresh PROCESSING (`started_at = now()`), old COMPLETED row, and an already-refunded FAILED row are untouched (compare with query C).
+5. Refund recovery: SQL G -> cron returns `reconciled: 1`, one REFUND row.
+6. Concurrent runs (command above) -> total `refunded` across both = 1; query F empty.
+7. History shows the row as Failed with "Generation timed out before completion."; no creation is created for it.
+8. Phase 14A regression: R2 upload, finalize, Expand/Editor on an R2 asset; Text-to-Image success and a forced provider failure (single refund).
+
+## Known gaps
+- Not typechecked/linted/built/runtime-tested.
+- The cleanup-vs-success race is closed by the conditional UPDATEs but has not been exercised under real concurrency.
+- If a late-finishing request loses the race, its output **storage objects stay in the bucket** (only the `creations` rows are soft-deleted). Orphan reporting/cleanup is left for a later phase.
+- Ordinary (non-timeout) failures still do FAILED-update then refund as two steps; a process kill exactly between them strands that refund. The reconciliation is deliberately scoped to `GENERATION_TIMEOUT`.
+- Provider jobs are not cancelled.

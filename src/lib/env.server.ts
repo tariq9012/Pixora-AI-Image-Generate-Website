@@ -104,6 +104,15 @@ const envSchema = z
     // instance opens its own pool, so total connections = instances x this
     // value — lower it (e.g. 3) if Neon reports too many connections.
     DB_POOL_MAX: z.coerce.number().int().min(1).max(20).optional(),
+
+    // --- Stale-generation cleanup (Phase 14B) ---
+    // Shared secret for machine-to-machine cron endpoints. Vercel Cron sends
+    // it as `Authorization: Bearer <CRON_SECRET>`. Server-only (no VITE_).
+    CRON_SECRET: z.string().min(32, "CRON_SECRET must be at least 32 characters.").optional(),
+    // A PROCESSING generation (or QUEUED, by created_at) older than this many
+    // minutes is considered stranded. Default 15; bounded so a typo cannot
+    // fail live jobs (min) or leave credits stuck for a day (max).
+    GENERATION_STALE_MINUTES: z.coerce.number().int().min(5).max(240).optional(),
   })
   .superRefine((value, ctx) => {
     if (value.RESEND_API_KEY && !value.EMAIL_FROM) {
@@ -153,6 +162,16 @@ const envSchema = z
           path: ["RESEND_API_KEY"],
           message:
             "RESEND_API_KEY and EMAIL_FROM are required in production (no console email fallback).",
+        });
+      }
+
+      // The cleanup cron endpoint must never be reachable without a secret.
+      if (!value.CRON_SECRET) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["CRON_SECRET"],
+          message:
+            "CRON_SECRET is required in production (protects /api/cron/cleanup-generations; min 32 chars).",
         });
       }
 

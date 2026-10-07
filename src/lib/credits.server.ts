@@ -74,7 +74,7 @@ export async function refundCreditsIfNotAlready(
   amount: number,
   generationId: string,
   description: string,
-): Promise<void> {
+): Promise<boolean> {
   const [existingRefund] = await db
     .select({ id: creditTransactions.id })
     .from(creditTransactions)
@@ -82,9 +82,12 @@ export async function refundCreditsIfNotAlready(
       and(eq(creditTransactions.generationId, generationId), eq(creditTransactions.type, "REFUND")),
     );
 
-  if (existingRefund) return;
+  if (existingRefund) return false;
 
-  await db.transaction(async (tx) => {
+  // PHASE 14B: returns true only when THIS call actually wrote the REFUND
+  // row and restored the balance, so callers (the stale-generation cleanup
+  // job) can report accurate counts. Existing callers ignore the value.
+  return db.transaction(async (tx) => {
     // PHASE 14: insert the ledger row FIRST and only touch the balance if
     // that insert actually happened. With the partial unique index
     // `credit_transactions_generation_refund_unique_idx` (one REFUND row
@@ -106,12 +109,14 @@ export async function refundCreditsIfNotAlready(
       .onConflictDoNothing()
       .returning({ id: creditTransactions.id });
 
-    if (inserted.length === 0) return;
+    if (inserted.length === 0) return false;
 
     await tx
       .update(creditBalances)
       .set({ balance: sql`${creditBalances.balance} + ${amount}`, updatedAt: new Date() })
       .where(eq(creditBalances.userId, userId));
+
+    return true;
   });
 }
 
